@@ -1,0 +1,486 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
+import express, { Request, Response } from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as pdfParseModule from 'pdf-parse';
+const pdfParse: any = (pdfParseModule as any).default || pdfParseModule;
+import { createServer as createViteServer } from 'vite';
+
+import {
+  extractJobRequirementsWithAI,
+  parseResumeWithAI,
+  reassessCommitDiffWithAI,
+  runComprehensiveAssessment,
+  computeJobReadinessVerdict,
+} from './server/ai.ts';
+import {
+  compareRepoCommits,
+  fetchFileContents,
+  fetchGitHubRepoDetails,
+  parseGitHubUrl,
+  type RepoAnalysisData,
+} from './server/github.ts';
+import {
+  clearAppState,
+  getAppState,
+  resetToSampleState,
+  saveAppState,
+} from './server/store.ts';
+import type {
+  AppState,
+  ChangeHistoryEntry,
+  JobRequirementSkill,
+  ResumeClaim,
+} from './src/types/index.ts';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+async function startServer() {
+  const app = express();
+  const PORT = Number(process.env.PORT) || 3000;
+
+  app.use(express.json({ limit: '25mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+
+  // 1. GET FULL APP STATE
+  app.get('/api/state', (_req: Request, res: Response) => {
+    try {
+      const state = getAppState();
+      res.json(state);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to get state' });
+    }
+  });
+
+  // 2. RESUME UPLOAD & PARSING
+  app.post('/api/resume/upload', async (req: Request, res: Response) => {
+    try {
+      const { fileName, fileBase64, rawText, fileSize } = req.body;
+      let textContent = rawText || '';
+
+      if (fileBase64 && (!textContent || textContent.trim().length === 0)) {
+        const buffer = Buffer.from(fileBase64, 'base64');
+        if (fileName && fileName.toLowerCase().endsWith('.pdf')) {
+          try {
+            const parsedPdf = await pdfParse(buffer);
+            textContent = parsedPdf.text || '';
+          } catch (pdfErr) {
+            console.error('Error parsing PDF buffer:', pdfErr);
+            return res.status(400).json({
+              error: 'Could not extract text from this PDF. Please ensure it is not an image-only scan, or paste the text directly.',
+            });
+          }
+        } else {
+          textContent = buffer.toString('utf-8');
+        }
+      }
+
+      if (!textContent || textContent.trim().length < 15) {
+        return res.status(400).json({
+          error: 'Resume text appears empty. Please upload a readable document or paste your resume content.',
+        });
+      }
+
+      const { profile, claims } = await parseResumeWithAI(textContent);
+
+      const state = getAppState();
+      state.resume = {
+        fileName: fileName || 'Uploaded_Resume.pdf',
+        fileSize: fileSize || Buffer.byteLength(textContent, 'utf-8'),
+        uploadedAt: new Date().toISOString(),
+        rawText: textContent,
+        profile,
+        claims,
+      };
+
+      saveAppState(state);
+      res.json({ success: true, resume: state.resume });
+    } catch (err: any) {
+      console.error('Resume upload error:', err);
+      res.status(500).json({ error: err.message || 'Failed to process resume' });
+    }
+  });
+
+  // 3. EDIT RESUME CLAIMS / SKILLS
+  app.post('/api/resume/edit-claims', (req: Request, res: Response) => {
+    try {
+      const { claims, profile } = req.body;
+      const state = getAppState();
+      if (!state.resume) {
+        return res.status(400).json({ error: 'No resume found to edit' });
+      }
+      if (Array.isArray(claims)) {
+        state.resume.claims = claims as ResumeClaim[];
+      }
+      if (profile) {
+        state.resume.profile = { ...state.resume.profile, ...profile };
+      }
+      saveAppState(state);
+      res.json({ success: true, resume: state.resume });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to edit claims' });
+    }
+  });
+
+  // 4. REMOVE RESUME
+  app.delete('/api/resume', (_req: Request, res: Response) => {
+    try {
+      const state = getAppState();
+      state.resume = null;
+      saveAppState(state);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to remove resume' });
+    }
+  });
+
+  // 5. ADD GITHUB REPO
+  app.post('/api/github/add-repo', async (req: Request, res: Response) => {
+    try {
+      const { url } = req.body;
+      if (!url) {
+        return res.status(400).json({ error: 'Please provide a GitHub repository URL' });
+      }
+
+      const parsed = parseGitHubUrl(url);
+      if (!parsed) {
+        return res.status(400).json({
+          error: 'Invalid GitHub URL. Expected format: https://github.com/owner/repository',
+        });
+      }
+
+      const repoDetails = await fetchGitHubRepoDetails(parsed.owner, parsed.repo);
+      const state = getAppState();
+
+      // Check if already added
+      const existingIdx = state.repositories.findIndex((r) => r.id === repoDetails.id);
+      if (existingIdx >= 0) {
+        state.repositories[existingIdx] = repoDetails;
+      } else {
+        state.repositories.push(repoDetails);
+      }
+
+      saveAppState(state);
+      res.json({ success: true, repository: repoDetails, repositories: state.repositories });
+    } catch (err: any) {
+      console.error('Error adding GitHub repo:', err);
+      res.status(400).json({ error: err.message || 'Failed to inspect GitHub repository' });
+    }
+  });
+
+  // 6. DELETE GITHUB REPO
+  app.delete('/api/github/repo/:id', (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const state = getAppState();
+      state.repositories = state.repositories.filter((r) => r.id !== id);
+      saveAppState(state);
+      res.json({ success: true, repositories: state.repositories });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to remove repository' });
+    }
+  });
+
+  // 7. TOGGLE REPO INCLUSION FOR ASSESSMENT
+  app.patch('/api/github/repo/:id/toggle', (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const state = getAppState();
+      const repo = state.repositories.find((r) => r.id === id);
+      if (!repo) return res.status(404).json({ error: 'Repository not found' });
+
+      repo.selectedForAssessment = !repo.selectedForAssessment;
+      saveAppState(state);
+      res.json({ success: true, repository: repo, repositories: state.repositories });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to toggle repository' });
+    }
+  });
+
+  // 8. PARSE OR SAVE JOB
+  app.post('/api/job/parse', async (req: Request, res: Response) => {
+    try {
+      const { url, description, title } = req.body;
+      let rawDescription = description || '';
+
+      if (url && (!rawDescription || rawDescription.trim().length === 0)) {
+        try {
+          const fetchRes = await fetch(url, {
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              Accept: 'text/html,application/xhtml+xml,text/plain',
+            },
+            signal: AbortSignal.timeout(8000),
+          });
+
+          if (fetchRes.ok) {
+            const html = await fetchRes.text();
+            // Basic HTML to text conversion stripping script/style tags
+            rawDescription = html
+              .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+              .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+          } else {
+            return res.status(422).json({
+              error: `Unable to automatically retrieve job posting from ${url} (HTTP ${fetchRes.status}). Please paste the job description text directly.`,
+              needsManualPaste: true,
+            });
+          }
+        } catch (fetchErr: any) {
+          return res.status(422).json({
+            error: `Unable to access job URL directly due to site restrictions. Please paste the job description below.`,
+            needsManualPaste: true,
+          });
+        }
+      }
+
+      if (!rawDescription || rawDescription.trim().length < 20) {
+        return res.status(400).json({
+          error: 'Please provide the text of the job description or enter a reachable URL.',
+        });
+      }
+
+      const job = await extractJobRequirementsWithAI(title || '', rawDescription, url);
+      const state = getAppState();
+      state.job = job;
+      saveAppState(state);
+
+      res.json({ success: true, job });
+    } catch (err: any) {
+      console.error('Job parse error:', err);
+      res.status(500).json({ error: err.message || 'Failed to extract job requirements' });
+    }
+  });
+
+  // 9. UPDATE JOB SKILLS (USER EDIT/CORRECT)
+  app.post('/api/job/update-skills', (req: Request, res: Response) => {
+    try {
+      const { skills, title, company } = req.body;
+      const state = getAppState();
+      if (!state.job) {
+        return res.status(400).json({ error: 'No job selected to update' });
+      }
+
+      if (Array.isArray(skills)) {
+        state.job.skills = skills as JobRequirementSkill[];
+      }
+      if (title) state.job.title = title;
+      if (company) state.job.company = company;
+
+      saveAppState(state);
+      res.json({ success: true, job: state.job });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to update job requirements' });
+    }
+  });
+
+  // 10. RUN COMPREHENSIVE ASSESSMENT (CORE INTELLIGENCE)
+  app.post('/api/assess', async (_req: Request, res: Response) => {
+    try {
+      const state = getAppState();
+      if (!state.resume) {
+        return res.status(400).json({ error: 'Please upload a resume first to run the assessment.' });
+      }
+      if (!state.job) {
+        return res.status(400).json({ error: 'Please select or add a target job first.' });
+      }
+
+      const selectedRepos = state.repositories.filter((r) => r.selectedForAssessment);
+      if (selectedRepos.length === 0) {
+        return res.status(400).json({
+          error: 'Please add at least one GitHub repository and ensure it is selected for assessment.',
+        });
+      }
+
+      // Fetch relevant source code files for each selected repo
+      const reposData: RepoAnalysisData[] = [];
+      for (const repo of selectedRepos) {
+        const priorityPaths = repo.sampleFiles.map((sf) => sf.path);
+        const filesWithContent = await fetchFileContents(
+          repo.owner,
+          repo.repo,
+          repo.defaultBranch,
+          priorityPaths
+        );
+        reposData.push({
+          repo,
+          files: filesWithContent,
+        });
+      }
+
+      const { evidenceItems, consistencyFindings, verdict, actionPlan } =
+        await runComprehensiveAssessment(state.resume, reposData, state.job);
+
+      state.evidenceItems = evidenceItems;
+      state.consistencyFindings = consistencyFindings;
+      state.verdict = verdict;
+      state.actionPlan = actionPlan;
+
+      saveAppState(state);
+      res.json({
+        success: true,
+        evidenceItems,
+        consistencyFindings,
+        verdict,
+        actionPlan,
+      });
+    } catch (err: any) {
+      console.error('Assessment execution error:', err);
+      res.status(500).json({ error: err.message || 'Failed to run skill assessment' });
+    }
+  });
+
+  // 11. CHECK FOR GITHUB UPDATES & AUTOMATIC REASSESSMENT
+  app.post('/api/github/check-updates', async (_req: Request, res: Response) => {
+    try {
+      const state = getAppState();
+      if (state.repositories.length === 0) {
+        return res.json({ updated: false, message: 'No repositories connected to check.' });
+      }
+
+      let anyUpdatesFound = false;
+      const historyEntries: ChangeHistoryEntry[] = [];
+
+      for (const repo of state.repositories) {
+        const lastSha = repo.lastAnalyzedCommit.sha;
+        const comparison = await compareRepoCommits(repo.owner, repo.repo, lastSha);
+
+        if (comparison && comparison.hasNewerCommit) {
+          anyUpdatesFound = true;
+
+          // Reassess skills affected by this commit
+          const reassessment = state.job && state.evidenceItems.length > 0
+            ? await reassessCommitDiffWithAI(
+                state.job,
+                state.evidenceItems,
+                comparison,
+                repo.repo
+              )
+            : {
+                reassessedSkills: [],
+                unchangedSkills: [],
+                overallSummary: `New commit ${comparison.headCommitSha} detected. Run an assessment to verify skills.`,
+                updatedEvidence: state.evidenceItems,
+              };
+
+          // Update repo commit info
+          repo.lastAnalyzedCommit = {
+            sha: comparison.headCommitSha,
+            message: comparison.headCommitMessage,
+            date: comparison.headCommitDate,
+            author: comparison.headCommitAuthor,
+          };
+          repo.latestCommit = repo.lastAnalyzedCommit;
+          repo.hasUpdate = false;
+
+          // Update evidence and recompute verdict
+          if (reassessment.reassessedSkills.length > 0) {
+            state.evidenceItems = reassessment.updatedEvidence;
+            if (state.job) {
+              state.verdict = computeJobReadinessVerdict(state.evidenceItems, state.job);
+            }
+          }
+
+          // Add history entry
+          const historyEntry: ChangeHistoryEntry = {
+            id: `hist-${Date.now()}-${repo.id}`,
+            timestamp: new Date().toISOString(),
+            repoName: repo.repo,
+            previousCommitSha: comparison.baseCommitSha,
+            newCommitSha: comparison.headCommitSha,
+            commitMessage: comparison.headCommitMessage,
+            changedFiles: comparison.changedFiles,
+            reassessedSkills: reassessment.reassessedSkills,
+            unchangedSkills: reassessment.unchangedSkills,
+            overallChangeSummary: reassessment.overallSummary,
+          };
+
+          historyEntries.push(historyEntry);
+          state.history.unshift(historyEntry);
+        }
+      }
+
+      saveAppState(state);
+
+      res.json({
+        success: true,
+        updated: anyUpdatesFound,
+        historyEntries,
+        state,
+        message: anyUpdatesFound
+          ? `Detected new commits across your projects! Reassessment completed.`
+          : `All connected repositories are up to date with the latest analyzed commits.`,
+      });
+    } catch (err: any) {
+      console.error('Check updates error:', err);
+      res.status(500).json({ error: err.message || 'Failed to check GitHub updates' });
+    }
+  });
+
+  // 12. TOGGLE ACTION PLAN CHECKLIST ITEM
+  app.post('/api/action-plan/toggle-task', (req: Request, res: Response) => {
+    try {
+      const { planId, taskId } = req.body;
+      const state = getAppState();
+      const plan = state.actionPlan.find((p) => p.id === planId);
+      if (!plan) return res.status(404).json({ error: 'Plan item not found' });
+
+      const item = plan.checklist.find((c) => c.id === taskId);
+      if (!item) return res.status(404).json({ error: 'Checklist task not found' });
+
+      item.completed = !item.completed;
+      saveAppState(state);
+      res.json({ success: true, actionPlan: state.actionPlan });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to toggle task' });
+    }
+  });
+
+  // 13. RESET / SEED SAMPLE DATA
+  app.post('/api/seed-sample', (_req: Request, res: Response) => {
+    try {
+      const state = resetToSampleState();
+      res.json({ success: true, state });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to seed sample state' });
+    }
+  });
+
+  app.post('/api/clear-state', (_req: Request, res: Response) => {
+    try {
+      const state = clearAppState();
+      res.json({ success: true, state });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to clear state' });
+    }
+  });
+
+  // VITE DEV SERVER OR STATIC PROD
+  if (process.env.NODE_ENV === 'production') {
+    app.use(express.static(path.resolve(__dirname, 'dist')));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile(path.resolve(__dirname, 'dist/index.html'));
+    });
+  } else {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`SkillTrace.ai server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Fatal server start error:', err);
+  process.exit(1);
+});
